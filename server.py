@@ -969,6 +969,63 @@ def _extract_pdf_text(content: bytes) -> dict:
     }
 
 
+_ATTACHMENT_ACCEPT_HEADERS = ("application/pdf", "*/*", "application/octet-stream")
+
+
+def _api_path_from_link(link: Any) -> Optional[str]:
+    """Turn an absolute e-conomic link into an API path, only for the configured API host."""
+    if not isinstance(link, str) or not link:
+        return None
+    parsed = urlsplit(link)
+    base = urlsplit(BASE_URL)
+    if parsed.scheme and (parsed.scheme, parsed.netloc) != (base.scheme, base.netloc):
+        return None
+    try:
+        return _validate_api_path(parsed.path)
+    except ValueError:
+        return None
+
+
+def _attachment_file_paths(metadata: Any) -> list:
+    """Collect links in the attachment JSON that point at a downloadable file."""
+    found: list = []
+
+    def walk(value: Any, key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                walk(child, child_key)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, key)
+        elif isinstance(value, str) and value.startswith(("http://", "https://", "/")):
+            lowered = (key + " " + value).lower()
+            if "file" in lowered or "pdf" in lowered:
+                path = _api_path_from_link(value)
+                if path and path not in found:
+                    found.append(path)
+
+    walk(metadata)
+    return found
+
+
+async def _download_attachment(paths: list):
+    """Try each path with each Accept header until e-conomic returns the file."""
+    attempts = []
+    for path in paths:
+        for accept in _ATTACHMENT_ACCEPT_HEADERS:
+            response = await _send_request("GET", path, accept=accept)
+            attempts.append({"path": path, "accept": accept, "status": response.status_code})
+            if response.status_code < 400:
+                content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip()
+                if content_type == "application/json":
+                    attempts[-1]["note"] = "returned JSON, not a file"
+                    continue
+                return response, path, attempts
+            if response.status_code == 404:
+                break
+    return None, None, attempts
+
+
 @mcp.tool(annotations=_READ)
 async def get_journal_voucher_attachment(
     journal_number: int,
@@ -995,27 +1052,46 @@ async def get_journal_voucher_attachment(
     if voucher_number <= 0 or journal_number <= 0:
         raise ValueError("journal_number and voucher_number must be positive")
     encoded_year = _encode_identifier(accounting_year)
-    path = f"/journals/{journal_number}/vouchers/{encoded_year}-{voucher_number}/attachment/file"
-    response = await _send_request("GET", path, accept="application/pdf")
-    if response.status_code >= 400:
-        raise EconomicAPIError(response.status_code, "GET", path, _response_error_detail(response))
-    content_type = response.headers.get("Content-Type", "application/pdf").split(";", 1)[0]
+    base_path = f"/journals/{journal_number}/vouchers/{encoded_year}-{voucher_number}/attachment"
     result: dict[str, Any] = {
         "journalNumber": journal_number,
         "accountingYear": accounting_year,
         "voucherNumber": voucher_number,
-        "contentType": content_type,
-        "sizeBytes": len(response.content),
     }
+
+    # 1) Attachment metadata (JSON). e-conomic documents that it links to the file itself.
+    metadata: Any = None
+    try:
+        metadata = await _request("GET", base_path)
+        result["attachment"] = metadata
+    except EconomicAPIError as exc:
+        if exc.status_code == 404:
+            raise
+        result["attachmentMetadataError"] = str(exc)
+
+    # 2) Download the file, preferring the link e-conomic returns, then the documented path.
+    candidates = [path for path in _attachment_file_paths(metadata) if path]
+    if f"{base_path}/file" not in candidates:
+        candidates.append(f"{base_path}/file")
+    response, used_path, attempts = await _download_attachment(candidates)
+    result["downloadAttempts"] = attempts
+    if response is None:
+        result["error"] = "e-conomic refused every download attempt; see downloadAttempts and attachment"
+        return result
+
+    content_type = response.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0].strip()
+    content = response.content
+    is_pdf = content_type == "application/pdf" or content[:5] == b"%PDF-"
+    result.update({"filePath": used_path, "contentType": content_type, "sizeBytes": len(content)})
     if include_text:
-        if content_type == "application/pdf":
-            result.update(_extract_pdf_text(response.content))
+        if is_pdf:
+            result.update(_extract_pdf_text(content))
         else:
             result.update({"hasTextLayer": False, "pages": [], "note": "Not a PDF; use include_base64"})
     if include_base64:
-        if len(response.content) > _ATTACHMENT_BASE64_LIMIT_BYTES:
+        if len(content) > _ATTACHMENT_BASE64_LIMIT_BYTES:
             raise ValueError("Attachment is larger than 8 MB; download it in e-conomic instead")
-        result["base64"] = base64.b64encode(response.content).decode("ascii")
+        result["base64"] = base64.b64encode(content).decode("ascii")
     return result
 
 
