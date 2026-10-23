@@ -250,7 +250,7 @@ def test_mcp_lists_all_tools():
         async with Client(server.mcp) as client:
             tools = await client.list_tools()
             names = {tool.name for tool in tools}
-            assert len(tools) == 73
+            assert len(tools) == 74
             assert {"get_company_info", "list_customers", "get_account_entries", "economic_api_request"} <= names
 
     run(check_tools())
@@ -276,3 +276,75 @@ def test_mcp_invokes_tool_with_mocked_api(monkeypatch):
             assert result.data["agreementNumber"] == 123
 
     run(call_tool())
+
+
+def _tiny_text_pdf(text: str) -> bytes:
+    """Build a minimal one-page PDF with a text layer (no extra dependencies)."""
+    stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode()
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R "
+        b"/Resources << /Font << /F1 5 0 R >> >> >>",
+        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    out = b"%PDF-1.4\n"
+    offsets = []
+    for number, body in enumerate(objects, 1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
+    out += b"".join(f"{offset:010d} 00000 n \n".encode() for offset in offsets)
+    out += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode()
+    return out
+
+
+def test_journal_voucher_attachment_returns_text(monkeypatch):
+    pdf = _tiny_text_pdf("Vare 1234  24 stk  11,83")
+    seen = {}
+
+    def handler(request):
+        seen["path"] = request.url.path
+        seen["method"] = request.method
+        assert request.headers["Accept"] == "application/pdf"
+        return httpx.Response(200, content=pdf, headers={"Content-Type": "application/pdf"})
+
+    result = run(
+        request_with_transport(
+            monkeypatch,
+            handler,
+            server.get_journal_voucher_attachment(2, "2026/2027", 90003055, include_base64=True),
+        )
+    )
+    assert seen == {"method": "GET", "path": "/journals/2/vouchers/2026_6_2027-90003055/attachment/file"}
+    assert result["hasTextLayer"] is True
+    assert result["pageCount"] == 1
+    assert "24 stk" in result["pages"][0]["text"]
+    assert result["base64"]
+
+
+def test_journal_voucher_attachment_handles_missing_attachment(monkeypatch):
+    def handler(request):
+        return httpx.Response(404, json={"message": "Attachment not found"})
+
+    with pytest.raises(server.EconomicAPIError, match="404"):
+        run(
+            request_with_transport(
+                monkeypatch, handler, server.get_journal_voucher_attachment(2, "2026/2027", 1)
+            )
+        )
+
+
+def test_journal_voucher_attachment_without_text_layer(monkeypatch):
+    def handler(request):
+        return httpx.Response(200, content=b"%PDF-1.4 broken", headers={"Content-Type": "application/pdf"})
+
+    result = run(
+        request_with_transport(
+            monkeypatch, handler, server.get_journal_voucher_attachment(2, "2026/2027", 5)
+        )
+    )
+    assert result["hasTextLayer"] is False
+    assert "base64" not in result
