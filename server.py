@@ -940,6 +940,85 @@ async def get_journal_vouchers(journal_number: int, skip_pages: int = 0, page_si
     return await _get_collection(f"/journals/{journal_number}/vouchers", skip_pages, page_size)
 
 
+_ATTACHMENT_TEXT_LIMIT = 60_000
+_ATTACHMENT_BASE64_LIMIT_BYTES = 8 * 1024 * 1024
+
+
+def _extract_pdf_text(content: bytes) -> dict:
+    """Extract the text layer of a PDF page by page. Scanned PDFs have no text layer."""
+    from io import BytesIO
+
+    from pypdf import PdfReader
+
+    try:
+        reader = PdfReader(BytesIO(content))
+        pages = [(page.extract_text() or "").strip() for page in reader.pages]
+    except Exception as exc:  # malformed or encrypted PDFs
+        return {"pageCount": None, "pages": [], "hasTextLayer": False, "textError": type(exc).__name__}
+
+    remaining = _ATTACHMENT_TEXT_LIMIT
+    trimmed = []
+    for text in pages:
+        trimmed.append(text[:remaining])
+        remaining = max(remaining - len(text), 0)
+    return {
+        "pageCount": len(pages),
+        "pages": [{"page": index + 1, "text": text} for index, text in enumerate(trimmed)],
+        "hasTextLayer": any(pages),
+        "textTruncated": sum(len(text) for text in pages) > _ATTACHMENT_TEXT_LIMIT,
+    }
+
+
+@mcp.tool(annotations=_READ)
+async def get_journal_voucher_attachment(
+    journal_number: int,
+    accounting_year: str,
+    voucher_number: int,
+    include_text: bool = True,
+    include_base64: bool = False,
+) -> Any:
+    """Read the attached document (the supplier invoice PDF) of an unbooked voucher in a journal.
+
+    Use this to see the invoice lines (items, quantities, unit prices) behind a supplier
+    invoice in a kassekladde. Find journal_number, accounting_year and voucher_number with
+    get_journal_vouchers / get_journal_entries. Only vouchers still in a journal (not yet
+    booked) have attachments reachable through this endpoint.
+
+    Args:
+        journal_number: Journal (kassekladde) holding the voucher, e.g. 2.
+        accounting_year: Accounting year as shown by e-conomic, e.g. "2026/2027".
+        voucher_number: Voucher (bilag) number, e.g. 90003055.
+        include_text: Return the PDF's text page by page (default). Scanned invoices
+            without a text layer return hasTextLayer=false; ask for include_base64 then.
+        include_base64: Also return the file itself base64-encoded (max 8 MB).
+    """
+    if voucher_number <= 0 or journal_number <= 0:
+        raise ValueError("journal_number and voucher_number must be positive")
+    encoded_year = _encode_identifier(accounting_year)
+    path = f"/journals/{journal_number}/vouchers/{encoded_year}-{voucher_number}/attachment/file"
+    response = await _send_request("GET", path, accept="application/pdf")
+    if response.status_code >= 400:
+        raise EconomicAPIError(response.status_code, "GET", path, _response_error_detail(response))
+    content_type = response.headers.get("Content-Type", "application/pdf").split(";", 1)[0]
+    result: dict[str, Any] = {
+        "journalNumber": journal_number,
+        "accountingYear": accounting_year,
+        "voucherNumber": voucher_number,
+        "contentType": content_type,
+        "sizeBytes": len(response.content),
+    }
+    if include_text:
+        if content_type == "application/pdf":
+            result.update(_extract_pdf_text(response.content))
+        else:
+            result.update({"hasTextLayer": False, "pages": [], "note": "Not a PDF; use include_base64"})
+    if include_base64:
+        if len(response.content) > _ATTACHMENT_BASE64_LIMIT_BYTES:
+            raise ValueError("Attachment is larger than 8 MB; download it in e-conomic instead")
+        result["base64"] = base64.b64encode(response.content).decode("ascii")
+    return result
+
+
 @mcp.tool(tags={"write"}, annotations=_CREATE, auth=_WRITE_AUTH)
 async def create_finance_voucher(
     journal_number: int,

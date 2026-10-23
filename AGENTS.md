@@ -6,7 +6,7 @@ Follow the setup protocol below. Reply in the user's language (most users are Da
 
 ## What this repository is
 
-A FastMCP server (`server.py`) that exposes the Visma e-conomic accounting API as 73 MCP
+A FastMCP server (`server.py`) that exposes the Visma e-conomic accounting API as 74 MCP
 tools over Streamable HTTP, protected by a personal login (Google or Microsoft) and/or an
 access key (`auth.py`). It is meant to run on Railway (or any host) and be used from
 Claude, Codex, Cursor and other MCP clients. `GUIDE.md` is the human walkthrough in
@@ -178,8 +178,8 @@ exactly what to click and wait for them.
 
 - Install: `pip install -r requirements-dev.txt`. Test: `python -m pytest -q` (no network needed).
 - Every write tool must be declared with `tags={"write"}` and a non-read-only annotation so
-  read-only mode hides it; `tests/test_auth.py` asserts 58 visible tools in read-only mode
-  and 73 in total. Update both numbers when adding tools.
+  read-only mode hides it; `tests/test_auth.py` asserts 59 visible tools in read-only mode
+  and 74 in total. Update both numbers when adding tools.
 - Authentication lives in `auth.py`; `resolve_auth_settings()` is pure and fully tested.
   Add a test for every new environment variable.
 - Do not log tool arguments or e-conomic payloads; the audit log records identity, tool
@@ -199,7 +199,7 @@ exactly what to click and wait for them.
 
 | Path | Purpose |
 |---|---|
-| `server.py` | FastMCP server, e-conomic HTTP client, the 73 tools, health route, entrypoint |
+| `server.py` | FastMCP server, e-conomic HTTP client, the 74 tools, health route, entrypoint |
 | `auth.py` | Login modes, allowlist, access keys, audit middleware |
 | `scripts/doctor.py` | Setup and deployment checker |
 | `scripts/install_skills.py` | Copies or links the skills into ~/.claude/skills and ~/.agents/skills |

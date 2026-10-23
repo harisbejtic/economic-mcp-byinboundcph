@@ -294,7 +294,7 @@ def test_write_tools_hidden_for_users_outside_write_list(monkeypatch):
     restricted = dataclasses.replace(server.AUTH_SETTINGS, write_users=frozenset({"cfo"}))
     monkeypatch.setattr(server, "AUTH_SETTINGS", restricted)
     visible = run(visible_tools())  # in-memory client has no token -> not on the list
-    assert len(visible) == 58 and "create_draft_invoice" not in visible
+    assert len(visible) == 59 and "create_draft_invoice" not in visible
 
     async def fake_request(method, path, params=None, json=None, idempotency_key=None):
         return {"method": method}
@@ -305,7 +305,7 @@ def test_write_tools_hidden_for_users_outside_write_list(monkeypatch):
         run(server.economic_api_request("POST", "/customers", body={}))
 
     monkeypatch.setattr(server, "AUTH_SETTINGS", dataclasses.replace(restricted, write_users=frozenset()))
-    assert len(run(visible_tools())) == 73
+    assert len(run(visible_tools())) == 74
 
 
 # ---------------------------------------------------------------------------
@@ -365,13 +365,13 @@ def test_read_only_mode_hides_every_write_tool():
     server.mcp.disable(tags={"write"})
     try:
         visible = run(visible_tools())
-        assert len(visible) == 58
+        assert len(visible) == 59
         for name in ("create_draft_invoice", "book_draft_invoice", "delete_customer", "create_journal_voucher"):
             assert name not in visible
         assert {"list_customers", "get_account_entries", "economic_api_request"} <= visible
     finally:
         server.mcp.enable(tags={"write"})
-    assert len(run(visible_tools())) == 73
+    assert len(run(visible_tools())) == 74
 
 
 def test_generic_request_is_get_only_in_read_only_mode(monkeypatch):

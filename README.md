@@ -1,7 +1,7 @@
 # e-conomic MCP Server by InboundCPH
 
 A [FastMCP](https://gofastmcp.com) server that exposes the [Visma e-conomic](https://www.e-conomic.dk/)
-REST API as 73 MCP tools over Streamable HTTP. The server is the gate in front of your
+REST API as 74 MCP tools over Streamable HTTP. The server is the gate in front of your
 e-conomic tokens: **one access key per person**, **e-mail + password login hosted by the
 server**, or **Google/Microsoft login** with an **allowlist**, plus **read-only mode** and an
 **audit log**. Runs on Railway in minutes.
@@ -47,7 +47,7 @@ python scripts/doctor.py --public-url https://<your-domain>
 Then replace the `demo` tokens with your own (GUIDE.md step 1), add one key per person or
 personal login (step 3) and connect your client (step 4).
 
-## Features (73 tools)
+## Features (74 tools)
 
 - **Company**: `get_company_info` (agreement/company details via `/self`)
 - **Customers**: list/get/create/update/delete customers, contacts, delivery locations, per-customer draft/booked invoices, totals, customer groups
@@ -56,7 +56,7 @@ personal login (step 3) and connect your client (step 4).
 - **Invoices**: draft/booked/sent/paid/unpaid/overdue/not-due invoices, invoice totals, `create_draft_invoice`, `update_draft_invoice`, `book_draft_invoice`, `register_invoice_as_sent`, `delete_draft_invoice`, PDF download (draft + booked, base64)
 - **Quotes**: draft/sent/archived quotes, `register_quote_as_sent`
 - **Orders**: draft/sent/archived orders
-- **Accounting**: chart of accounts, account entries by accounting year, accounting years, periods, year/period totals, journals, journal entries and vouchers, `create_finance_voucher`, `create_journal_voucher` (raw)
+- **Accounting**: chart of accounts, account entries by accounting year, accounting years, periods, year/period totals, journals, journal entries and vouchers, `get_journal_voucher_attachment` (supplier invoice PDF behind an unbooked voucher, as text and/or base64), `create_finance_voucher`, `create_journal_voucher` (raw)
 - **Reference data**: payment terms, payment types, VAT zones/accounts/types, currencies, layouts, units, departments, departmental distributions, employees
 - **Escape hatch**: `economic_api_request` — call any e-conomic REST endpoint (method, path, params, body) not covered by a dedicated tool
 
@@ -129,7 +129,7 @@ then listens on `127.0.0.1` and logs a warning.
 - `MCP_READ_ONLY=true` hides every tool that creates, changes, books or deletes anything
   (15 tools) and limits `economic_api_request` to `GET`. Start with it on.
 - `MCP_WRITE_USERS=cfo,anna@firma.dk` limits the write tools to the listed identities (key
-  names or e-mails) when read-only is off. Everyone else sees only the 58 read tools, cannot
+  names or e-mails) when read-only is off. Everyone else sees only the 59 read tools, cannot
   call the write tools even by name, and gets `GET` only from the generic API tool.
 - Every tool call is logged as `tool=… user=… status=… duration_ms=…` on the
   `economic-mcp.audit` logger. `user` is the e-mail of the logged-in person, the key name
