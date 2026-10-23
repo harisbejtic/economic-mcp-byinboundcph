@@ -301,15 +301,26 @@ def _tiny_text_pdf(text: str) -> bytes:
     return out
 
 
-def test_journal_voucher_attachment_returns_text(monkeypatch):
+ATTACHMENT_BASE = "/journals/2/vouchers/2026_6_2027-90003055/attachment"
+
+
+def test_journal_voucher_attachment_follows_link_and_retries_accept(monkeypatch):
     pdf = _tiny_text_pdf("Vare 1234  24 stk  11,83")
-    seen = {}
+    requests = []
 
     def handler(request):
-        seen["path"] = request.url.path
-        seen["method"] = request.method
-        assert request.headers["Accept"] == "application/pdf"
-        return httpx.Response(200, content=pdf, headers={"Content-Type": "application/pdf"})
+        requests.append((request.url.path, request.headers["Accept"]))
+        if request.url.path == ATTACHMENT_BASE:
+            return httpx.Response(200, json={
+                "pages": 1,
+                "file": f"{server.BASE_URL}{ATTACHMENT_BASE}/file",
+                "self": f"{server.BASE_URL}{ATTACHMENT_BASE}",
+            })
+        if request.url.path == f"{ATTACHMENT_BASE}/file":
+            if request.headers["Accept"] == "application/pdf":
+                return httpx.Response(406, json={"message": "Compliant accept header not found in request."})
+            return httpx.Response(200, content=pdf, headers={"Content-Type": "application/pdf"})
+        return httpx.Response(404, json={"message": "not found"})
 
     result = run(
         request_with_transport(
@@ -318,11 +329,46 @@ def test_journal_voucher_attachment_returns_text(monkeypatch):
             server.get_journal_voucher_attachment(2, "2026/2027", 90003055, include_base64=True),
         )
     )
-    assert seen == {"method": "GET", "path": "/journals/2/vouchers/2026_6_2027-90003055/attachment/file"}
+    assert requests[0] == (ATTACHMENT_BASE, "application/json")
+    assert result["attachment"]["pages"] == 1
+    assert result["filePath"] == f"{ATTACHMENT_BASE}/file"
+    assert [a["status"] for a in result["downloadAttempts"]] == [406, 200]
     assert result["hasTextLayer"] is True
-    assert result["pageCount"] == 1
     assert "24 stk" in result["pages"][0]["text"]
     assert result["base64"]
+
+
+def test_journal_voucher_attachment_ignores_foreign_links(monkeypatch):
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        if request.url.path == ATTACHMENT_BASE:
+            return httpx.Response(200, json={"file": "https://evil.example.com/steal.pdf"})
+        return httpx.Response(200, content=b"%PDF-1.4 x", headers={"Content-Type": "application/pdf"})
+
+    result = run(
+        request_with_transport(
+            monkeypatch, handler, server.get_journal_voucher_attachment(2, "2026/2027", 90003055)
+        )
+    )
+    assert not any("evil.example.com" in url for url in seen)
+    assert result["filePath"] == f"{ATTACHMENT_BASE}/file"
+
+
+def test_journal_voucher_attachment_reports_refusals(monkeypatch):
+    def handler(request):
+        if request.url.path == ATTACHMENT_BASE:
+            return httpx.Response(200, json={"pages": 1})
+        return httpx.Response(406, json={"message": "Compliant accept header not found in request."})
+
+    result = run(
+        request_with_transport(
+            monkeypatch, handler, server.get_journal_voucher_attachment(2, "2026/2027", 90003055)
+        )
+    )
+    assert "error" in result
+    assert len(result["downloadAttempts"]) == len(server._ATTACHMENT_ACCEPT_HEADERS)
 
 
 def test_journal_voucher_attachment_handles_missing_attachment(monkeypatch):
@@ -339,6 +385,8 @@ def test_journal_voucher_attachment_handles_missing_attachment(monkeypatch):
 
 def test_journal_voucher_attachment_without_text_layer(monkeypatch):
     def handler(request):
+        if request.url.path.endswith("/attachment"):
+            return httpx.Response(200, json={})
         return httpx.Response(200, content=b"%PDF-1.4 broken", headers={"Content-Type": "application/pdf"})
 
     result = run(
