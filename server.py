@@ -19,6 +19,7 @@ import asyncio
 import base64
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional
 from urllib.parse import quote, urlsplit
@@ -105,6 +106,19 @@ def _validated_base_url(value: str) -> str:
 
 
 BASE_URL = _validated_base_url(os.environ.get("ECONOMIC_BASE_URL", "https://restapi.e-conomic.com"))
+# The newer e-conomic OpenAPI (apis.e-conomic.com). Used for the Documents API, which, unlike
+# the legacy REST API, also serves the documents attached to booked entries.
+OPENAPI_BASE_URL = _validated_base_url(os.environ.get("ECONOMIC_OPENAPI_BASE_URL", "https://apis.e-conomic.com"))
+
+
+def _validated_api_version(name: str, default: str) -> str:
+    value = (os.environ.get(name) or default).strip()
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", value):
+        raise RuntimeError(f"{name} must look like v4.0.2")
+    return value
+
+
+DOCUMENTS_API_VERSION = _validated_api_version("ECONOMIC_DOCUMENTS_API_VERSION", "v4.0.2")
 APP_SECRET_TOKEN = os.environ.get("ECONOMIC_APP_SECRET_TOKEN", "demo").strip()
 AGREEMENT_GRANT_TOKEN = os.environ.get("ECONOMIC_AGREEMENT_GRANT_TOKEN", "demo").strip()
 REQUEST_TIMEOUT_SECONDS = _read_float_setting("ECONOMIC_REQUEST_TIMEOUT_SECONDS", 30.0, 1.0)
@@ -284,9 +298,12 @@ async def _send_request(
     json: Any = None,
     idempotency_key: Optional[str] = None,
     accept: str = "application/json",
+    base_url: Optional[str] = None,
 ) -> httpx.Response:
     method = method.upper()
     path = _validate_api_path(path)
+    # base_url selects another trusted e-conomic host (the OpenAPI); it is never caller input.
+    target = f"{base_url}{path}" if base_url and base_url != BASE_URL else path
     request_headers = {"Accept": accept}
     if json is not None:
         request_headers["Content-Type"] = "application/json"
@@ -302,7 +319,7 @@ async def _send_request(
             try:
                 response = await client.request(
                     method,
-                    path,
+                    target,
                     headers=request_headers,
                     params=params,
                     json=json,
@@ -332,8 +349,9 @@ async def _request(
     params: Optional[dict] = None,
     json: Any = None,
     idempotency_key: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> Any:
-    response = await _send_request(method, path, params, json, idempotency_key)
+    response = await _send_request(method, path, params, json, idempotency_key, base_url=base_url)
     if response.status_code >= 400:
         raise EconomicAPIError(response.status_code, method.upper(), path, _response_error_detail(response))
     if response.status_code == 204 or not response.content:
@@ -1008,12 +1026,12 @@ def _attachment_file_paths(metadata: Any) -> list:
     return found
 
 
-async def _download_attachment(paths: list):
+async def _download_attachment(paths: list, base_url: Optional[str] = None):
     """Try each path with each Accept header until e-conomic returns the file."""
     attempts = []
     for path in paths:
         for accept in _ATTACHMENT_ACCEPT_HEADERS:
-            response = await _send_request("GET", path, accept=accept)
+            response = await _send_request("GET", path, accept=accept, base_url=base_url)
             attempts.append({"path": path, "accept": accept, "status": response.status_code})
             if response.status_code < 400:
                 content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip()
@@ -1024,6 +1042,160 @@ async def _download_attachment(paths: list):
             if response.status_code == 404:
                 break
     return None, None, attempts
+
+
+def _file_result(response: httpx.Response, include_text: bool, include_base64: bool) -> dict:
+    """Describe a downloaded attachment: type, size, PDF text and optionally the bytes."""
+    content_type = response.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0].strip()
+    content = response.content
+    is_pdf = content_type == "application/pdf" or content[:5] == b"%PDF-"
+    result: dict[str, Any] = {"contentType": content_type, "sizeBytes": len(content)}
+    if include_text:
+        if is_pdf:
+            result.update(_extract_pdf_text(content))
+        else:
+            result.update({"hasTextLayer": False, "pages": [], "note": "Not a PDF; use include_base64"})
+    if include_base64:
+        if len(content) > _ATTACHMENT_BASE64_LIMIT_BYTES:
+            raise ValueError("Attachment is larger than 8 MB; download it in e-conomic instead")
+        result["base64"] = base64.b64encode(content).decode("ascii")
+    return result
+
+
+_DOCUMENTS_SCAN_MAX_PAGES = 20
+
+
+def _documents_path(suffix: str = "") -> str:
+    return f"/documentsapi/{DOCUMENTS_API_VERSION}/AttachedDocuments{suffix}"
+
+
+def _document_items(payload: Any) -> list:
+    """The Documents API returns a bare list or an object wrapping one; accept both."""
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ("items", "collection", "data", "attachedDocuments"):
+            if isinstance(payload.get(key), list):
+                return [item for item in payload[key] if isinstance(item, dict)]
+    return []
+
+
+def _year_digits(value: Any) -> str:
+    """Normalise '2026/2027', '2026_6_2027' and '2026 - 2027' to '20262027' for comparison."""
+    text = str(value or "")
+    text = text.replace("_6_", "/")
+    return "".join(re.findall(r"\d{4}", text))
+
+
+def _same_accounting_year(document_year: Any, wanted: str) -> bool:
+    if document_year in (None, ""):
+        return True  # the API did not say; do not drop the document
+    have, want = _year_digits(document_year), _year_digits(wanted)
+    if not have or not want:
+        return str(document_year).strip() == wanted.strip()
+    return have == want or have in want or want in have
+
+
+async def _find_attached_documents(accounting_year: str, voucher_number: int) -> tuple[list, dict]:
+    """Look up the documents attached to a voucher (booked or not) via the Documents API."""
+    diagnostics: dict[str, Any] = {}
+    filtered = None
+    try:
+        filtered = await _request(
+            "GET",
+            _documents_path("/paged"),
+            params={"filter": f"voucherNumber$eq:{voucher_number}", "skippages": 0, "pagesize": 100},
+            base_url=OPENAPI_BASE_URL,
+        )
+    except EconomicAPIError as exc:
+        if exc.status_code not in (400, 404):
+            raise
+        diagnostics["filterError"] = str(exc)
+
+    if filtered is not None:
+        items = _document_items(filtered)
+    else:
+        # The filter was refused: scan the collection with the cursor instead (bounded).
+        items, cursor = [], None
+        for _ in range(_DOCUMENTS_SCAN_MAX_PAGES):
+            params = {"cursor": cursor} if cursor else None
+            page = await _request("GET", _documents_path(), params=params, base_url=OPENAPI_BASE_URL)
+            items.extend(item for item in _document_items(page) if item.get("voucherNumber") == voucher_number)
+            cursor = page.get("cursor") if isinstance(page, dict) else None
+            if not cursor:
+                break
+        else:
+            diagnostics["scanTruncated"] = True
+
+    matches = [
+        item
+        for item in items
+        if item.get("voucherNumber") in (None, voucher_number)
+        and _same_accounting_year(item.get("accountingYear"), accounting_year)
+    ]
+    return matches, diagnostics
+
+
+async def _attached_documents_result(
+    accounting_year: str, voucher_number: int, include_text: bool, include_base64: bool
+) -> dict:
+    documents, diagnostics = await _find_attached_documents(accounting_year, voucher_number)
+    result: dict[str, Any] = {
+        "source": "documentsapi",
+        "accountingYear": accounting_year,
+        "voucherNumber": voucher_number,
+        "documents": [],
+        **diagnostics,
+    }
+    if not documents:
+        result["error"] = "No attached document found for this voucher number and accounting year"
+        return result
+    for document in documents:
+        entry: dict[str, Any] = {"document": document}
+        number = document.get("number")
+        if not isinstance(number, int) or number <= 0:
+            entry["error"] = "Document has no usable number"
+        else:
+            response, used_path, attempts = await _download_attachment(
+                [_documents_path(f"/{number}/pdf")], base_url=OPENAPI_BASE_URL
+            )
+            entry["downloadAttempts"] = attempts
+            if response is None:
+                entry["error"] = "e-conomic refused every download attempt; see downloadAttempts"
+            else:
+                entry["filePath"] = used_path
+                entry.update(_file_result(response, include_text, include_base64))
+        result["documents"].append(entry)
+    return result
+
+
+@mcp.tool(annotations=_READ)
+async def get_voucher_document(
+    accounting_year: str,
+    voucher_number: int,
+    include_text: bool = True,
+    include_base64: bool = False,
+) -> Any:
+    """Read the document (the supplier invoice PDF) attached to any voucher, including BOOKED ones.
+
+    Use this to see the invoice lines (items, quantities, unit prices) behind a supplier
+    invoice after it has been booked, e.g. when reconciling a closed month. The voucher
+    number is the bilag number shown on the entries (voucherNumber in
+    get_accounting_year_entries). Uses e-conomic's Documents API, which keys documents on
+    accounting year + voucher number (the journal is not part of the key).
+
+    Args:
+        accounting_year: Accounting year as shown by e-conomic, e.g. "2026/2027".
+        voucher_number: Voucher (bilag) number, e.g. 90002955.
+        include_text: Return the PDF's text page by page (default). Scanned invoices
+            without a text layer return hasTextLayer=false; ask for include_base64 then.
+        include_base64: Also return the file itself base64-encoded (max 8 MB per document).
+    """
+    if voucher_number <= 0:
+        raise ValueError("voucher_number must be positive")
+    if not accounting_year or not accounting_year.strip():
+        raise ValueError("accounting_year is required")
+    return await _attached_documents_result(accounting_year.strip(), voucher_number, include_text, include_base64)
 
 
 @mcp.tool(annotations=_READ)
@@ -1038,8 +1210,9 @@ async def get_journal_voucher_attachment(
 
     Use this to see the invoice lines (items, quantities, unit prices) behind a supplier
     invoice in a kassekladde. Find journal_number, accounting_year and voucher_number with
-    get_journal_vouchers / get_journal_entries. Only vouchers still in a journal (not yet
-    booked) have attachments reachable through this endpoint.
+    get_journal_vouchers / get_journal_entries. If the voucher is no longer in the journal
+    because it has been booked, the tool falls back to get_voucher_document (Documents API)
+    and returns that result instead (source = "documentsapi").
 
     Args:
         journal_number: Journal (kassekladde) holding the voucher, e.g. 2.
@@ -1066,6 +1239,13 @@ async def get_journal_voucher_attachment(
         result["attachment"] = metadata
     except EconomicAPIError as exc:
         if exc.status_code == 404:
+            # Booked vouchers leave the journal; their documents live in the Documents API.
+            fallback = await _attached_documents_result(
+                accounting_year, voucher_number, include_text, include_base64
+            )
+            if fallback["documents"]:
+                fallback["journalLookup"] = str(exc)
+                return fallback
             raise
         result["attachmentMetadataError"] = str(exc)
 
@@ -1079,19 +1259,8 @@ async def get_journal_voucher_attachment(
         result["error"] = "e-conomic refused every download attempt; see downloadAttempts and attachment"
         return result
 
-    content_type = response.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0].strip()
-    content = response.content
-    is_pdf = content_type == "application/pdf" or content[:5] == b"%PDF-"
-    result.update({"filePath": used_path, "contentType": content_type, "sizeBytes": len(content)})
-    if include_text:
-        if is_pdf:
-            result.update(_extract_pdf_text(content))
-        else:
-            result.update({"hasTextLayer": False, "pages": [], "note": "Not a PDF; use include_base64"})
-    if include_base64:
-        if len(content) > _ATTACHMENT_BASE64_LIMIT_BYTES:
-            raise ValueError("Attachment is larger than 8 MB; download it in e-conomic instead")
-        result["base64"] = base64.b64encode(content).decode("ascii")
+    result["filePath"] = used_path
+    result.update(_file_result(response, include_text, include_base64))
     return result
 
 

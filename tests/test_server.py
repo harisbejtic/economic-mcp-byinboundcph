@@ -250,8 +250,8 @@ def test_mcp_lists_all_tools():
         async with Client(server.mcp) as client:
             tools = await client.list_tools()
             names = {tool.name for tool in tools}
-            assert len(tools) == 74
-            assert {"get_company_info", "list_customers", "get_account_entries", "economic_api_request"} <= names
+            assert len(tools) == 75
+            assert {"get_company_info", "list_customers", "get_account_entries", "economic_api_request", "get_voucher_document"} <= names
 
     run(check_tools())
 
@@ -396,3 +396,97 @@ def test_journal_voucher_attachment_without_text_layer(monkeypatch):
     )
     assert result["hasTextLayer"] is False
     assert "base64" not in result
+
+
+DOCS_PREFIX = f"/documentsapi/{server.DOCUMENTS_API_VERSION}/AttachedDocuments"
+
+
+def test_validated_api_version(monkeypatch):
+    monkeypatch.delenv("ECONOMIC_DOCUMENTS_API_VERSION", raising=False)
+    assert server._validated_api_version("ECONOMIC_DOCUMENTS_API_VERSION", "v4.0.2") == "v4.0.2"
+    monkeypatch.setenv("ECONOMIC_DOCUMENTS_API_VERSION", "v5.1.0")
+    assert server._validated_api_version("ECONOMIC_DOCUMENTS_API_VERSION", "v4.0.2") == "v5.1.0"
+    for bad in ("4.0.2", "v4", "v4.0.2/../x", "latest"):
+        monkeypatch.setenv("ECONOMIC_DOCUMENTS_API_VERSION", bad)
+        with pytest.raises(RuntimeError, match="must look like"):
+            server._validated_api_version("ECONOMIC_DOCUMENTS_API_VERSION", "v4.0.2")
+
+
+def test_openapi_base_url_defaults_to_economic_openapi():
+    assert server.OPENAPI_BASE_URL == "https://apis.e-conomic.com"
+
+
+def test_same_accounting_year_accepts_economic_spellings():
+    assert server._same_accounting_year("2026/2027", "2026/2027")
+    assert server._same_accounting_year("2026_6_2027", "2026/2027")
+    assert server._same_accounting_year("2026", "2026/2027")
+    assert server._same_accounting_year(None, "2026/2027")
+    assert not server._same_accounting_year("2025/2026", "2026/2027")
+
+
+def test_voucher_document_reads_booked_voucher_from_documents_api(monkeypatch):
+    pdf = _tiny_text_pdf("Collagen Tropical  72 stk  74,38")
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.host, request.url.path, dict(request.url.params), request.headers["Accept"]))
+        assert request.headers["X-AppSecretToken"] == server.APP_SECRET_TOKEN
+        if request.url.path == f"{DOCS_PREFIX}/paged":
+            return httpx.Response(200, json=[
+                {"number": 555, "voucherNumber": 90002955, "accountingYear": "2026/2027"},
+                {"number": 556, "voucherNumber": 90002955, "accountingYear": "2025/2026"},
+            ])
+        if request.url.path == f"{DOCS_PREFIX}/555/pdf":
+            return httpx.Response(200, content=pdf, headers={"Content-Type": "application/pdf"})
+        return httpx.Response(404, json={"message": "not found"})
+
+    result = run(request_with_transport(monkeypatch, handler, server.get_voucher_document("2026/2027", 90002955)))
+    assert seen[0][0] == "apis.e-conomic.com"
+    assert seen[0][2]["filter"] == "voucherNumber$eq:90002955"
+    assert len(result["documents"]) == 1
+    document = result["documents"][0]
+    assert document["document"]["number"] == 555
+    assert "72 stk" in document["pages"][0]["text"]
+    assert not any(path.endswith("/556/pdf") for _, path, _, _ in seen)
+
+
+def test_voucher_document_scans_with_cursor_when_filter_is_refused(monkeypatch):
+    def handler(request):
+        path = request.url.path
+        if path == f"{DOCS_PREFIX}/paged":
+            return httpx.Response(400, json={"message": "Property is not filterable"})
+        if path == DOCS_PREFIX and "cursor" not in request.url.params:
+            return httpx.Response(200, json={"items": [{"number": 1, "voucherNumber": 7}], "cursor": "abc"})
+        if path == DOCS_PREFIX:
+            return httpx.Response(200, json={"items": [{"number": 2, "voucherNumber": 42, "accountingYear": "2026/2027"}]})
+        if path == f"{DOCS_PREFIX}/2/pdf":
+            return httpx.Response(200, content=b"%PDF-1.4 x", headers={"Content-Type": "application/pdf"})
+        return httpx.Response(404, json={})
+
+    result = run(request_with_transport(monkeypatch, handler, server.get_voucher_document("2026/2027", 42)))
+    assert "filterError" in result
+    assert [d["document"]["number"] for d in result["documents"]] == [2]
+
+
+def test_voucher_document_reports_missing_document(monkeypatch):
+    def handler(request):
+        return httpx.Response(200, json=[])
+
+    result = run(request_with_transport(monkeypatch, handler, server.get_voucher_document("2026/2027", 42)))
+    assert result["documents"] == [] and "error" in result
+
+
+def test_journal_voucher_attachment_falls_back_to_documents_api_for_booked_voucher(monkeypatch):
+    def handler(request):
+        if request.url.host == "apis.e-conomic.com":
+            if request.url.path.endswith("/paged"):
+                return httpx.Response(200, json=[{"number": 9, "voucherNumber": 90002955, "accountingYear": "2026/2027"}])
+            return httpx.Response(200, content=b"%PDF-1.4 x", headers={"Content-Type": "application/pdf"})
+        return httpx.Response(404, json={"message": "Could not find voucher with number 90002955 in journal 2"})
+
+    result = run(
+        request_with_transport(monkeypatch, handler, server.get_journal_voucher_attachment(2, "2026/2027", 90002955))
+    )
+    assert result["source"] == "documentsapi"
+    assert result["documents"][0]["document"]["number"] == 9
+    assert "journalLookup" in result
