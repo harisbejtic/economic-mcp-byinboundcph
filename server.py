@@ -375,19 +375,44 @@ async def _get_collection(path: str, skip_pages: int = 0, page_size: int = 20, f
     return await _request("GET", path, params=params)
 
 
+# e-conomic's PDF endpoints answer 406 "Compliant accept header not found in request" for
+# some Accept values, and which ones it takes is not documented (its examples send none).
+# Try them in order and move on only after a 406.
+_PDF_ACCEPT_HEADERS = ("application/pdf", "*/*", "application/json", "application/octet-stream")
+
+
+def _looks_like_pdf(response: httpx.Response) -> bool:
+    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    return content_type == "application/pdf" or response.content[:5] == b"%PDF-"
+
+
 async def _request_pdf(path: str) -> Any:
     """Fetch a PDF from the e-conomic REST API and return it base64-encoded."""
-    response = await _send_request("GET", path, accept="application/pdf")
-    if response.status_code >= 400:
-        raise EconomicAPIError(response.status_code, "GET", path, _response_error_detail(response))
-    content_type = response.headers.get("Content-Type", "application/pdf").split(";", 1)[0]
-    if content_type != "application/pdf":
-        raise RuntimeError(f"e-conomic API returned {content_type}, expected application/pdf")
-    return {
-        "contentType": content_type,
-        "sizeBytes": len(response.content),
-        "base64": base64.b64encode(response.content).decode("ascii"),
-    }
+    attempts: list = []
+    last_406: Optional[httpx.Response] = None
+    for accept in _PDF_ACCEPT_HEADERS:
+        response = await _send_request("GET", path, accept=accept)
+        attempts.append({"accept": accept, "status": response.status_code})
+        if response.status_code == 406:
+            last_406 = response
+            continue
+        if response.status_code >= 400:
+            raise EconomicAPIError(response.status_code, "GET", path, _response_error_detail(response))
+        if not _looks_like_pdf(response):
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0] or "no content type"
+            attempts[-1]["note"] = f"returned {content_type}, not a PDF"
+            continue
+        return {
+            "contentType": "application/pdf",
+            "sizeBytes": len(response.content),
+            "base64": base64.b64encode(response.content).decode("ascii"),
+        }
+    if last_406 is not None and all(attempt["status"] == 406 for attempt in attempts):
+        detail = _response_error_detail(last_406)
+        if isinstance(detail, dict):
+            detail = {**detail, "acceptHeadersTried": list(_PDF_ACCEPT_HEADERS)}
+        raise EconomicAPIError(406, "GET", path, detail)
+    raise RuntimeError(f"e-conomic API returned no PDF for GET {path}; attempts: {attempts}")
 
 
 # ---------------------------------------------------------------------------
