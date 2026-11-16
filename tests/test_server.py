@@ -190,6 +190,43 @@ def test_request_pdf_validates_content_type(monkeypatch):
     assert result["base64"] == "JVBERi0xLjc="
 
 
+def test_request_pdf_falls_back_after_406(monkeypatch):
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["Accept"])
+        if request.headers["Accept"] == "application/pdf":
+            return httpx.Response(406, json={"message": "Compliant accept header not found in request."})
+        return httpx.Response(200, content=b"%PDF-1.4 x", headers={"Content-Type": "application/octet-stream"})
+
+    result = run(request_with_transport(monkeypatch, handler, server._request_pdf("/invoices/booked/1/pdf")))
+    assert seen == ["application/pdf", "*/*"]
+    assert result["contentType"] == "application/pdf"
+    assert result["sizeBytes"] == 10
+
+
+def test_request_pdf_reports_every_accept_header_when_all_are_refused(monkeypatch):
+    def handler(request):
+        return httpx.Response(406, json={"message": "Compliant accept header not found in request."})
+
+    with pytest.raises(server.EconomicAPIError) as excinfo:
+        run(request_with_transport(monkeypatch, handler, server._request_pdf("/invoices/booked/1/pdf")))
+    assert excinfo.value.status_code == 406
+    assert excinfo.value.detail["acceptHeadersTried"] == list(server._PDF_ACCEPT_HEADERS)
+
+
+def test_request_pdf_does_not_retry_other_errors(monkeypatch):
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["Accept"])
+        return httpx.Response(404, json={"message": "Not found"})
+
+    with pytest.raises(server.EconomicAPIError):
+        run(request_with_transport(monkeypatch, handler, server._request_pdf("/invoices/booked/1/pdf")))
+    assert seen == ["application/pdf"]
+
+
 def test_corrected_tool_paths_and_payloads(monkeypatch):
     calls = []
 
